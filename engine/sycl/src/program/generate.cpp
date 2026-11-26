@@ -2849,6 +2849,20 @@ int main(int argc, char **argv) try {
             o.pcie_frac = pcie_frac_for_gbps(bw, base, trellis ? 12.0 : 20.0);
             std::fprintf(stderr, "strata generate: PCIe probe: %.1f GB/s host->device (best of %s) -> pcie_frac %.2f "
                                  "(default %.2f)\n", bw, bursts.c_str(), o.pcie_frac, base);
+            // One card copies the probe out of pageable memory (PR #1669 above: the pcie_frac rule was measured that way),
+            // which reads well under the link on an Arc (B70, PCIe 5.0 x16: 23-26 GB/s against 57 GB/s from pinned
+            // memory), while the expert mirror the GPU reads in decode is pinned.  The pinned rate is printed beside it so
+            // the log names the link's real rate; nothing is decided from it.  STRATA_PCIE_PROBE_PINNED=0 skips it.
+            if (!multi_gpu) {
+                const char* pp = std::getenv("STRATA_PCIE_PROBE_PINNED");
+                if (!(pp && pp[0] == '0')) {
+                    std::string pinned_bursts;
+                    const double pinned = probe_pcie_h2d_gbps(&pinned_bursts, true);
+                    if (pinned > 0.0)
+                        std::fprintf(stderr, "strata generate: PCIe probe from pinned memory (the expert mirror's kind): %.1f GB/s "
+                                             "host->device (best of %s); not used for pcie_frac\n", pinned, pinned_bursts.c_str());
+                }
+            }
             {   // PcieAuto on SYCL: opt-in (STRATA_PCIE_FRAC_DEFAULT=auto), one card, not the xe NO_HOST path
                 const char* pfd = std::getenv("STRATA_PCIE_FRAC_DEFAULT");
                 o.pcie_frac_auto = pfd != nullptr && std::strcmp(pfd, "auto") == 0 && o.layer_split.empty();
