@@ -28,6 +28,8 @@ GgufExpertSource::~GgufExpertSource() { close(); }
 void GgufExpertSource::close() {
     for (uint8_t* c : mirror_chunks_) if (c) sycl::free(c, dpct::get_in_order_queue());
     mirror_chunks_.clear();
+    for (uint8_t* c : spare_allocs_) if (c) sycl::free(c, dpct::get_in_order_queue());
+    spare_allocs_.clear(); spare_.clear(); spare_pending_.clear();
     mirror_bytes_ = 0; mirror_ptr_.clear(); layer_first_.clear();
     for (int fd : fds_) if (fd >= 0) ::close(fd);
     fds_.clear(); names_.clear(); layer_fd_.clear(); ring_.clear(); ring_key_.clear(); where_.clear();
@@ -297,5 +299,67 @@ bool GgufExpertSource::exchange_cached_expert(int64_t layer, int32_t incoming, i
         mirror_ptr_[in] = nullptr;
         return true;
     } catch (const std::exception& e) { err = e.what(); return false; }
+}
+namespace {
+uint64_t spare_size(int64_t layer) {
+    return (strata::kernels::cpu::expert_layout().bytes[(size_t) layer] + 255) / 256 * 256;
+}
+}  // namespace
+
+bool GgufExpertSource::exchange_dma_reserve(int per_size, std::string& err) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (mirror_ptr_.empty() || per_size <= 0) { err = "exchange DMA: no mirror"; return false; }
+    std::vector<uint64_t> sizes;
+    for (int64_t l = 0; l < n_layers_; ++l) {
+        const uint64_t b = spare_size(l);
+        if (std::find(sizes.begin(), sizes.end(), b) == sizes.end()) sizes.push_back(b);
+    }
+    for (uint64_t b : sizes) {
+        auto& pool = spare_[b];
+        for (int i = (int) pool.size(); i < per_size; ++i) {
+            uint8_t* p = nullptr;
+            try { p = (uint8_t*) sycl::malloc_host((size_t) b, dpct::get_in_order_queue()); } catch (...) { p = nullptr; }
+            if (p == nullptr) { err = "exchange DMA: no pinned host memory for the spare blobs"; return false; }
+            spare_allocs_.push_back(p);
+            pool.push_back(p);
+        }
+    }
+    return true;
+}
+
+bool GgufExpertSource::exchange_cached_expert_dma(int64_t layer, int32_t incoming, int32_t outgoing, void* device_slot,
+                                                  void* copy_queue, std::string& err) {
+    err.clear();
+    if (layer < 0 || layer >= n_layers_ || incoming < 0 || outgoing < 0 || incoming >= n_expert_ || outgoing >= n_expert_ ||
+        incoming == outgoing || mirror_ptr_.empty() || copy_queue == nullptr || device_slot == nullptr) {
+        err = "mirror cache exchange invalid identity"; return false;
+    }
+    if (strata::kernels::b60_weights_packed()) return false;   // (its packed layout exchanges the old way)
+    const size_t in = (size_t) (layer * n_expert_ + incoming), out = (size_t) (layer * n_expert_ + outgoing);
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!mirror_ptr_[in] || mirror_ptr_[out]) {
+        err = "mirror cache exchange requires incoming mirror and unmirrored outgoing"; return false;
+    }
+    auto it = spare_.find(spare_size(layer));
+    if (it == spare_.end() || it->second.empty()) return false;
+    uint8_t* spare = it->second.back();
+    uint8_t* memory = mirror_ptr_[in];
+    const size_t n = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(layer);
+    try {
+        sycl::queue& q = *static_cast<sycl::queue*>(copy_queue);   // (in order or not: the second copy waits for the first)
+        const sycl::event out_done = q.memcpy(spare, device_slot, n);   // the outgoing expert's bytes to its new mirror blob
+        q.memcpy(device_slot, memory, n, out_done);                     // then the incoming expert's into the slot
+    } catch (const std::exception& e) { err = e.what(); return false; }
+    it->second.pop_back();
+    mirror_ptr_[out] = spare;
+    mirror_ptr_[in] = nullptr;
+    spare_pending_.push_back({spare_size(layer), memory});
+    return true;
+}
+
+void GgufExpertSource::exchange_dma_finished() {
+    std::lock_guard<std::mutex> lock(mu_);
+    for (const auto& [b, p] : spare_pending_) spare_[b].push_back(p);
+    spare_pending_.clear();
 }
 }  // namespace strata::core

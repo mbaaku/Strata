@@ -62,6 +62,16 @@ public:
     bool exchange_cached_expert(int64_t layer, int32_t incoming, int32_t outgoing,
                                 void* device_slot, void* stream, std::string& err, bool wait = true);
     uint64_t mirrored_bytes() const { return mirror_bytes_; }
+    // STRATA_ADAPT_EXCHANGE_DMA (opt-in): the same exchange by the copy engine and without a host-to-host copy.  The
+    // outgoing expert's VRAM bytes go to a spare pinned blob of the layer's size, which becomes its mirror; the incoming
+    // expert's mirror bytes go to the slot; the incoming expert's old mirror blob becomes a spare once the copies have
+    // finished (exchange_dma_finished, after the caller drained `copy_queue`).  Both copies are only queued on
+    // `copy_queue` (in order).  false with an empty `err`: no spare of that size is free (the caller exchanges the old
+    // way).  exchange_dma_reserve: `per_size` spare blobs (pinned host) for every distinct blob size of the model.
+    bool exchange_dma_reserve(int per_size, std::string& err);
+    bool exchange_cached_expert_dma(int64_t layer, int32_t incoming, int32_t outgoing, void* device_slot,
+                                    void* copy_queue, std::string& err);
+    void exchange_dma_finished();
 
 private:
     int fd_of(int64_t layer, int role, std::string& err);
@@ -83,6 +93,9 @@ private:
     uint64_t mirror_bytes_ = 0;
     std::vector<uint8_t*> mirror_ptr_;             ///< per (layer, expert): its blob in the chunks, null = not mirrored
     std::vector<const uint8_t*> layer_first_;      ///< per layer: its first mirrored blob, null = none
+    std::unordered_map<uint64_t, std::vector<uint8_t*>> spare_;   ///< STRATA_ADAPT_EXCHANGE_DMA: free blobs by size
+    std::vector<std::pair<uint64_t, uint8_t*>> spare_pending_;    ///< freed by queued copies, spare once they finished
+    std::vector<uint8_t*> spare_allocs_;                           ///< the spares' own allocations (freed in close)
 };
 
 }  // namespace strata::core
