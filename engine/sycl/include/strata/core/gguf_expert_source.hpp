@@ -57,8 +57,10 @@ public:
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
     // Same-layer cache replacement. The caller drains consumers before this exchange,
     // then updates cache/residency and the device mirror table before running them again.
+    // `wait` false (STRATA_ADAPT_EXCHANGE_BATCH): the copy is queued on `stream` only; the caller waits for the stream once
+    // after a batch of exchanges (each moves a different slot and a different mirror blob), before anything reads them.
     bool exchange_cached_expert(int64_t layer, int32_t incoming, int32_t outgoing,
-                                void* device_slot, void* stream, std::string& err);
+                                void* device_slot, void* stream, std::string& err, bool wait = true);
     uint64_t mirrored_bytes() const { return mirror_bytes_; }
 
 private:

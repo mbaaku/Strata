@@ -245,7 +245,7 @@ bool GgufExpertSource::read_into(int64_t layer, int64_t expert, uint8_t* dst, si
 // Exchange existing host/device bytes without an additional expert blob.
 namespace {
 class MirrorCacheExchange;
-void exchange_mirror_bytes(uint8_t* device, uint8_t* mirror, size_t bytes, sycl::queue& q) {
+void exchange_mirror_bytes(uint8_t* device, uint8_t* mirror, size_t bytes, sycl::queue& q, bool wait) {
     if (!device || !mirror || !bytes || bytes % 16 ||
         (reinterpret_cast<uintptr_t>(device) & 15) || (reinterpret_cast<uintptr_t>(mirror) & 15) ||
         sycl::get_pointer_type(device, q.get_context()) != sycl::usm::alloc::device ||
@@ -265,12 +265,12 @@ void exchange_mirror_bytes(uint8_t* device, uint8_t* mirror, size_t bytes, sycl:
             old_host.store(0, dp + 4 * i);
             old_device.store(0, hp + 4 * i);
         });
-    q.wait_and_throw();
+    if (wait) q.wait_and_throw();
 }
 }  // namespace
 
 bool GgufExpertSource::exchange_cached_expert(int64_t layer, int32_t incoming, int32_t outgoing,
-                                             void* device_slot, void* stream, std::string& err) {
+                                             void* device_slot, void* stream, std::string& err, bool wait) {
     if (layer < 0 || layer >= n_layers_ || incoming < 0 || outgoing < 0 ||
         incoming >= n_expert_ || outgoing >= n_expert_ || incoming == outgoing ||
         mirror_ptr_.empty() || !stream) {
@@ -291,7 +291,7 @@ bool GgufExpertSource::exchange_cached_expert(int64_t layer, int32_t incoming, i
                 f.gu_type, (size_t)f.up_off, (size_t)f.down_off, (size_t)layout.blob_bytes(layer), stream);
         } else {
             exchange_mirror_bytes(static_cast<uint8_t*>(device_slot), memory,
-                (size_t)layout.blob_bytes(layer), *static_cast<sycl::queue*>(stream));
+                (size_t)layout.blob_bytes(layer), *static_cast<sycl::queue*>(stream), wait);
         }
         mirror_ptr_[out] = memory;
         mirror_ptr_[in] = nullptr;

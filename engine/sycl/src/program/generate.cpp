@@ -5542,12 +5542,14 @@ int main(int argc, char **argv) try {
     }
 
     if (sycl_mirror_adapt()) {
+        // The prompt loan (--prefill-borrow, the default) is allowed: the adaptive exchanges below never touch a slot the
+        // prompt path borrows ([lend_first, slots)), so the loan's refill puts back the experts those slots held.
         if (!o.serve || !o.stream_experts || srcp != &gguf_src || !stages.empty() ||
             o.peer_device >= 0 || remote_caches ||
-            !o.no_prefill_borrow || o.vram_elastic || !mirror_table_d || unmirrored_misses ||
+            o.vram_elastic || !mirror_table_d || unmirrored_misses ||
             o.adapt_every <= 0 || o.adapt_swaps <= 0 || o.adapt_swaps > 96 ||
             !o.expert_profile_save.empty()) {
-            std::fprintf(stderr, "SYCL mirror adaptive cache requires single-device complete stream mirror, no borrow/elastic/profile save\n");
+            std::fprintf(stderr, "SYCL mirror adaptive cache requires single-device complete stream mirror, no elastic VRAM/profile save\n");
             return 1;
         }
         std::fprintf(stderr, "SYCL mirror adaptive cache: sync exchange; %lld slots, %lld cache bytes, %llu mirror bytes\n",
@@ -8861,7 +8863,9 @@ int main(int argc, char **argv) try {
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                     if (r[e] < 0) { if (u[e] >= 2.0f && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e)) cand.emplace_back(u[e], e); }
-                    else vict.emplace_back(u[e], e);
+                    // the mirror-adaptive exchange leaves the prompt loan's slots alone: their refill after a prompt puts
+                    // back what they held, and their experts keep a mirror copy (STRATA_LEND_MIRROR) the exchange refuses
+                    else if (!(sycl_mirror_adapt() && lend_first >= 0 && r[e] >= lend_first)) vict.emplace_back(u[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;
                 std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { if (sycl_mirror_adapt() && a.first == b.first) return a.second < b.second; return a.first > b.first; });
@@ -8877,17 +8881,25 @@ int main(int argc, char **argv) try {
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
             if (sycl_mirror_adapt()) {
                 std::string error;
+                // STRATA_ADAPT_EXCHANGE_BATCH=1 (opt-in): the batch's exchanges are queued and the adapt stream is waited
+                // for once, instead of once per exchange (up to --adapt-swaps host<->GPU round trips in the decode loop)
+                static const bool batch_wait = [] { const char* v = std::getenv("STRATA_ADAPT_EXCHANGE_BATCH"); return v && v[0] == '1'; }();
+                const bool queued = batch_wait && !strata::kernels::b60_weights_packed();
                 for (const Swap& s : swaps) {
                     const size_t in = (size_t)s.layer * g.n_expert + s.in;
                     const size_t out = (size_t)s.layer * g.n_expert + s.out;
                     const int32_t slot = host_res[out];
                     if (host_res[in] >= 0 || slot < 0 || xcache.slot_of(s.layer, s.out) != slot ||
-                        !gguf_src.exchange_cached_expert(s.layer, s.in, s.out, xcache.device_slot(slot), adapt_stream, error)) {
+                        !gguf_src.exchange_cached_expert(s.layer, s.in, s.out, xcache.device_slot(slot), adapt_stream, error, !queued)) {
                         std::fprintf(stderr, "SYCL mirror adaptive exchange failed: %s\n", error.c_str()); return false;
                     }
                     xcache.replace(s.layer, s.out, s.in);
                     host_res[out] = strata::core::kNotResident;
                     host_res[in] = slot;
+                }
+                if (queued && !swaps.empty()) {
+                    try { adapt_stream->wait_and_throw(); }
+                    catch (const std::exception& e) { std::fprintf(stderr, "SYCL mirror adaptive exchange failed: %s\n", e.what()); return false; }
                 }
                 if (!swaps.empty()) {
                     std::vector<unsigned long long> tab(host_res.size(), 0ull);
@@ -8896,7 +8908,7 @@ int main(int argc, char **argv) try {
                         if (host_res[at] < 0) {
                             if (!gguf_src.pinned(l, e)) { std::fprintf(stderr, "SYCL mirror adaptive mirror complement missing\n"); return false; }
                             tab[at] = (unsigned long long)gguf_src.device_alias(l, e);
-                        } else if (gguf_src.pinned(l, e)) {
+                        } else if (gguf_src.pinned(l, e) && !(lend_first >= 0 && host_res[at] >= lend_first)) {
                             std::fprintf(stderr, "SYCL mirror adaptive mirror/cache overlap\n"); return false;
                         }
                     }
