@@ -3073,4 +3073,69 @@ void gdn_step_norm_qkreg(float* state, const float* h, int conv_channels, const 
     check("gdn_step_norm_qkreg");
 }
 
+// STRATA_MIRROR_STAGE: see resident_plan_mirror.hpp.  Work-group (y, x) copies part x of the y-th group (in plan
+// order) whose blob is outside the arena; every work-item finds that group by itself (<= 80 groups, a few loads).
+// The second launch rewrites the pointers only after every copy has finished (in-order queue): a copy work-group
+// still reads the mirror address from the plan.  A rewritten address (a staging slot) is outside the arena as well,
+// so the ordinal of every group is the same whether a work-item reads the old or the new address.
+namespace {
+class MirrorStageCopyKernel;
+class MirrorStageRebaseKernel;
+inline bool mirror_outside(unsigned long long p, uint64_t lo, uint64_t hi) { return p != 0 && (p < lo || p >= hi); }
+}  // namespace
+
+void mirror_stage_blobs(unsigned long long* ptr, const int32_t* n_groups, uint64_t arena_lo, uint64_t arena_hi,
+                        uint8_t* stage, int64_t stride, int64_t blob_bytes, int cap, int wgs_per_blob, void* stream) {
+    if (ptr == nullptr || n_groups == nullptr || stage == nullptr || cap <= 0 || blob_bytes <= 0 || stride < blob_bytes)
+        return;
+    const int X = std::max(1, std::min(wgs_per_blob, 256));
+    dpct::queue_ptr q = strata::q_of(stream);
+    auto exp_props = sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync};
+    const size_t bytes = (size_t) blob_bytes, st = (size_t) stride;
+    strata::kprof::kp(q, __FILE__, __func__, __LINE__)
+        ->template parallel_for<MirrorStageCopyKernel>(
+            sycl::nd_range<2>(sycl::range<2>((size_t) cap, (size_t) X * 256), sycl::range<2>(1, 256)), exp_props,
+            [=](sycl::nd_item<2> it) {
+                const int y = (int) it.get_group(0);
+                const int ng = *n_groups;
+                int gi = -1, ord = 0;
+                for (int g = 0; g < ng; ++g) {
+                    if (mirror_outside(ptr[g], arena_lo, arena_hi)) {
+                        if (ord == y) { gi = g; break; }
+                        ++ord;
+                    }
+                }
+                if (gi < 0) return;
+                const uint8_t* src = (const uint8_t*) ptr[gi];
+                uint8_t* dst = stage + (size_t) y * st;
+                const size_t lid = it.get_group(1) * 256 + it.get_local_id(1), step = (size_t) X * 256;
+                if ((((uintptr_t) src | (uintptr_t) dst) & 15) == 0) {
+                    const size_t words = bytes / 16;
+                    const sycl::uint4* s4 = (const sycl::uint4*) src;
+                    sycl::uint4* d4 = (sycl::uint4*) dst;
+                    size_t i = lid;
+                    for (; i + 3 * step < words; i += 4 * step) {   // four 16-byte loads in flight per work-item
+                        const sycl::uint4 a = s4[i], b = s4[i + step], c = s4[i + 2 * step], d = s4[i + 3 * step];
+                        d4[i] = a; d4[i + step] = b; d4[i + 2 * step] = c; d4[i + 3 * step] = d;
+                    }
+                    for (; i < words; i += step) d4[i] = s4[i];
+                    for (size_t b = words * 16 + lid; b < bytes; b += step) dst[b] = src[b];
+                } else {
+                    for (size_t b = lid; b < bytes; b += step) dst[b] = src[b];
+                }
+            });
+    check("mirror_stage_blobs/copy");
+    strata::kprof::kp(q, __FILE__, __func__, __LINE__)
+        ->template parallel_for<MirrorStageRebaseKernel>(
+            sycl::nd_range<1>(sycl::range<1>(128), sycl::range<1>(128)), exp_props, [=](sycl::nd_item<1> it) {
+                const int g = (int) it.get_local_id(0);
+                const int ng = *n_groups;
+                if (g >= ng || !mirror_outside(ptr[g], arena_lo, arena_hi)) return;
+                int ord = 0;
+                for (int j = 0; j < g; ++j) ord += mirror_outside(ptr[j], arena_lo, arena_hi) ? 1 : 0;
+                if (ord < cap) ptr[g] = (unsigned long long) (stage + (size_t) ord * st);
+            });
+    check("mirror_stage_blobs/rebase");
+}
+
 }  // namespace strata::kernels

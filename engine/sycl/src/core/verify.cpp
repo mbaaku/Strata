@@ -21,6 +21,7 @@
 #include "strata/core/peer_experts.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/expert_staging.hpp"
+#include "strata/kernels/resident_plan_mirror.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
@@ -788,7 +789,17 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
         one_ = b.take<int32_t>(4);
         hist_snap_ = b.take<float>(T * HS);
         ple_key_ = b.take<float>(T * (uint64_t) strata::kernels::NG_HC_DIM); ple_val_ = b.take<float>(T * N);
+        // STRATA_MIRROR_STAGE with STRATA_MIRROR_STAGE_CAP above kStagingBlobs: its own slots (staging_ serves 16)
+        mstage_ = mstage_slots_ > 0 ? b.take<uint8_t>((uint64_t) mstage_slots_ * strata::kernels::cpu::expert_layout().max_blob)
+                                    : nullptr;
     };
+    {   // STRATA_MIRROR_STAGE: how many copy slots the window needs (decided before the arena is carved)
+        const char* ms = std::getenv("STRATA_MIRROR_STAGE");
+        const char* cap_env = std::getenv("STRATA_MIRROR_STAGE_CAP");
+        const long cap = cap_env ? std::atol(cap_env) : kStagingBlobs;
+        mstage_slots_ = (ms && ms[0] == '1' && cap > kStagingBlobs && strata::kernels::cpu::expert_layout().native)
+                            ? (int) std::min<long>(cap, kMirrorStageMax) : 0;
+    }
     Bump count;
     carve(count);
     if (DPCT_CHECK_ERROR(arena_ = (void *)strata::malloc_device_guarded(
@@ -973,6 +984,37 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
         functionality is redundant in SYCL.
         */
         if (!ok2) {; all_resident_ = false; device_plan_ = false; }
+    }
+    // STRATA_MIRROR_STAGE=1 (opt-in): the host-mirrored groups of a lean device-plan window are copied into the
+    // staging slots (staging_, kStagingBlobs, unused by that window otherwise) with wide loads before the grouped
+    // experts read them.  STRATA_MIRROR_STAGE_CAP=<n> caps the copies per group of the window (default 16, the
+    // staging slots; above 16, up to kMirrorStageMax, the window carves its own slots of max_blob each),
+    // STRATA_MIRROR_STAGE_WGS=<n> sets the work-groups of 256 per copied blob (default 32).
+    if (const char* ms = std::getenv("STRATA_MIRROR_STAGE"); ms && ms[0] == '1' && device_plan_ && !all_resident_ &&
+        hits.cache_base != nullptr && strata::kernels::cpu::expert_layout().native) {
+        const uint64_t max_blob = (uint64_t) strata::kernels::cpu::expert_layout().max_blob;
+        uint64_t end = 0;
+        if (hits.slot_off != nullptr && hits.n_slots > 0) {
+            for (int64_t i = 0; i < hits.n_slots; ++i) end = std::max<uint64_t>(end, hits.slot_off[i]);
+            end += max_blob;
+        } else if (hits.n_slots > 0) {
+            end = (uint64_t) hits.n_slots * (uint64_t) hits.blob;
+        }
+        if (end > 0) {
+            const char* cap_env = std::getenv("STRATA_MIRROR_STAGE_CAP");
+            const char* wgs_env = std::getenv("STRATA_MIRROR_STAGE_WGS");
+            mirror_stage_cap_ = mstage_ != nullptr ? mstage_slots_
+                                                   : (int) std::clamp<long>(cap_env ? std::atol(cap_env) : kStagingBlobs, 1, kStagingBlobs);
+            mirror_stage_wgs_ = (int) std::clamp<long>(wgs_env ? std::atol(wgs_env) : 32, 1, 256);
+            arena_lo_ = (uint64_t) (uintptr_t) hits.cache_base;
+            arena_hi_ = arena_lo_ + end;
+            mirror_stage_ = true;
+            std::fprintf(stderr, "strata verify: host-mirrored experts are copied to VRAM before the window's experts read "
+                                 "them (STRATA_MIRROR_STAGE, up to %d per group, %d work-groups each)\n",
+                         mirror_stage_cap_, mirror_stage_wgs_);
+        } else {
+            std::fprintf(stderr, "strata verify: STRATA_MIRROR_STAGE ignored: the expert arena's size is unknown\n");
+        }
     }
     if (sycl_mirror_adapt()) {
         if (!device_plan_ || !env_on("STRATA_VERIFY_NO_HOST"))
@@ -1766,6 +1808,15 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                 copy_i32_from_mapped(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
             }
             stamp(l, 19, grp);
+            if (mirror_stage_ && lean && device_plan_ && lay.native) {   // STRATA_MIRROR_STAGE (opt-in)
+                uint8_t* const base = mstage_ != nullptr ? mstage_ : staging_;
+                const int64_t slots = mstage_ != nullptr ? mstage_slots_ : kStagingBlobs;
+                const int64_t per = G == 2 ? slots / 2 : slots;
+                strata::kernels::mirror_stage_blobs(const_cast<unsigned long long*>(p_ptr), p_counts, arena_lo_, arena_hi_,
+                                                    base + (size_t) (grp * per) * lay.max_blob, (int64_t) lay.max_blob,
+                                                    (int64_t) lay.blob_bytes(l), (int) std::min<int64_t>(per, mirror_stage_cap_),
+                                                    mirror_stage_wgs_, cs);
+            }
             grouped(p_ptr, p_start, p_counts, 0, hit_out);
             stamp(l, 20, grp);
             // stepped mode: the plan copy + VRAM groups end a segment, so they run while the CPU computes its rows

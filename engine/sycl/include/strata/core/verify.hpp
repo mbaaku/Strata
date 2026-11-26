@@ -499,6 +499,14 @@ private:
     int32_t* plan_ = nullptr;                                     // device copy of the plan block
     uint8_t* staging_ = nullptr;                                  // VRAM slots for the PCIe share of the misses
     static constexpr int64_t kStagingBlobs = 16;
+    // STRATA_MIRROR_STAGE (opt-in): the lean device-plan window copies its host-mirrored groups into staging_
+    // before the grouped experts (resident_plan_mirror.hpp).  [arena_lo_, arena_hi_): the VRAM expert arena.
+    bool mirror_stage_ = false;
+    int mirror_stage_cap_ = 0, mirror_stage_wgs_ = 0;
+    uint64_t arena_lo_ = 0, arena_hi_ = 0;
+    uint8_t* mstage_ = nullptr;   // the window's own copy slots when STRATA_MIRROR_STAGE_CAP > kStagingBlobs
+    int mstage_slots_ = 0;
+    static constexpr int64_t kMirrorStageMax = 80;                // a window's entries at most (kVerifyMaxT x 10)
     static constexpr int64_t kPcieGroupRows = 4;                  // the PCIe call's groups side by side (of <= 16)
     uint8_t* hit_xq_ = nullptr;
     uint8_t* nat_xq_ = nullptr;   // plan v0.3 P6: q8_1 activations for a native pack's grouped experts

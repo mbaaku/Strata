@@ -79,6 +79,7 @@ namespace strata::prefill { void set_nonresident_share(double share); }   // SYC
 #include "strata/kernels/kv_q4.hpp"
 #include "../bmg_window_session.hpp"
 #include "strata/program/adapt_decay.hpp"
+#include "strata/copy_queue.hpp"
 #include "strata/program/split_rules.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/core/native_head.hpp"
@@ -149,6 +150,9 @@ namespace strata::prefill { void set_nonresident_share(double share); }   // SYC
 #include <vector>
 
 namespace {
+// STRATA_DECODE_TIMING: the mirror-adaptive exchanges' count and host time (decode loop, request thread only)
+long long g_adapt_swaps = 0;
+double g_adapt_ms = 0, g_adapt_wait_ms = 0;   // (wait: STRATA_ADAPT_EXCHANGE_DMA's drain after the draft)
 bool sycl_mirror_adapt() {
     static const bool enabled = [] {
         const char* v = std::getenv("STRATA_SYCL_MIRROR_ADAPT");
@@ -2849,6 +2853,20 @@ int main(int argc, char **argv) try {
             o.pcie_frac = pcie_frac_for_gbps(bw, base, trellis ? 12.0 : 20.0);
             std::fprintf(stderr, "strata generate: PCIe probe: %.1f GB/s host->device (best of %s) -> pcie_frac %.2f "
                                  "(default %.2f)\n", bw, bursts.c_str(), o.pcie_frac, base);
+            // One card copies the probe out of pageable memory (PR #1669 above: the pcie_frac rule was measured that way),
+            // which reads well under the link on an Arc (B70, PCIe 5.0 x16: 23-26 GB/s against 57 GB/s from pinned
+            // memory), while the expert mirror the GPU reads in decode is pinned.  The pinned rate is printed beside it so
+            // the log names the link's real rate; nothing is decided from it.  STRATA_PCIE_PROBE_PINNED=0 skips it.
+            if (!multi_gpu) {
+                const char* pp = std::getenv("STRATA_PCIE_PROBE_PINNED");
+                if (!(pp && pp[0] == '0')) {
+                    std::string pinned_bursts;
+                    const double pinned = probe_pcie_h2d_gbps(&pinned_bursts, true);
+                    if (pinned > 0.0)
+                        std::fprintf(stderr, "strata generate: PCIe probe from pinned memory (the expert mirror's kind): %.1f GB/s "
+                                             "host->device (best of %s); not used for pcie_frac\n", pinned, pinned_bursts.c_str());
+                }
+            }
             {   // PcieAuto on SYCL: opt-in (STRATA_PCIE_FRAC_DEFAULT=auto), one card, not the xe NO_HOST path
                 const char* pfd = std::getenv("STRATA_PCIE_FRAC_DEFAULT");
                 o.pcie_frac_auto = pfd != nullptr && std::strcmp(pfd, "auto") == 0 && o.layer_split.empty();
@@ -5542,12 +5560,14 @@ int main(int argc, char **argv) try {
     }
 
     if (sycl_mirror_adapt()) {
+        // The prompt loan (--prefill-borrow, the default) is allowed: the adaptive exchanges below never touch a slot the
+        // prompt path borrows ([lend_first, slots)), so the loan's refill puts back the experts those slots held.
         if (!o.serve || !o.stream_experts || srcp != &gguf_src || !stages.empty() ||
             o.peer_device >= 0 || remote_caches ||
-            !o.no_prefill_borrow || o.vram_elastic || !mirror_table_d || unmirrored_misses ||
+            o.vram_elastic || !mirror_table_d || unmirrored_misses ||
             o.adapt_every <= 0 || o.adapt_swaps <= 0 || o.adapt_swaps > 96 ||
             !o.expert_profile_save.empty()) {
-            std::fprintf(stderr, "SYCL mirror adaptive cache requires single-device complete stream mirror, no borrow/elastic/profile save\n");
+            std::fprintf(stderr, "SYCL mirror adaptive cache requires single-device complete stream mirror, no elastic VRAM/profile save\n");
             return 1;
         }
         std::fprintf(stderr, "SYCL mirror adaptive cache: sync exchange; %lld slots, %lld cache bytes, %llu mirror bytes\n",
@@ -8847,9 +8867,60 @@ int main(int argc, char **argv) try {
             for (float& v : drive.d.usage) v *= o.adapt_decay;
             return snap;
         };
+        // STRATA_ADAPT_EXCHANGE_DMA=1 (opt-in, the serve decode loop only): the mirror-adaptive exchanges are queued on the
+        // copy engine and not waited for; adapt_dma_wait() (after the window's commit and draft, which read no expert)
+        // drains them before anything reads the cache or the mirror again.  An exchange with no spare blob free goes the
+        // old way.  STRATA_ADAPT_EXCHANGE_DMA_SPARES=<n>: spare blobs per blob size (default 48).
+        static const bool adapt_dma_env = [] { const char* v = std::getenv("STRATA_ADAPT_EXCHANGE_DMA"); return v && v[0] == '1'; }();
+        bool adapt_async = false;       // set by the serve decode loop around its own adapt() call
+        bool adapt_dma_inflight = false;
+        std::unique_ptr<sycl::queue> adapt_dma_own;   // (only when the copy engine's own queue cannot be made)
+        sycl::queue* adapt_dma_q = nullptr;
+        if (adapt_dma_env && sycl_mirror_adapt() && !strata::kernels::b60_weights_packed()) {
+            const char* sp = std::getenv("STRATA_ADAPT_EXCHANGE_DMA_SPARES");
+            const int per = sp ? std::max(1, std::atoi(sp)) : 48;
+            std::string derr;
+            if (gguf_src.exchange_dma_reserve(per, derr)) {
+                // the copy engine's own queue (copy_queue.hpp: an ordinary SYCL queue copies on the compute engine with the
+                // Level Zero v2 adapter, where the exchanges would hold up the draft's kernels); the prompt path shares it,
+                // and no prompt runs beside a decode window
+                adapt_dma_q = strata::make_copy_engine_queue("the mirror-adaptive exchanges'");
+                const bool own_engine = adapt_dma_q != nullptr;
+                if (!own_engine) {
+                    adapt_dma_own = std::make_unique<sycl::queue>(dpct::get_in_order_queue().get_context(),
+                                                                  dpct::get_in_order_queue().get_device(),
+                                                                  sycl::property::queue::in_order());
+                    adapt_dma_q = adapt_dma_own.get();
+                }
+                std::fprintf(stderr, "strata serve: mirror-adaptive exchanges are queued beside the commit and the draft "
+                                     "(STRATA_ADAPT_EXCHANGE_DMA, %s, %d spare blobs per size)\n",
+                             own_engine ? "on the copy engine" : "no copy-engine queue: an ordinary queue", per);
+            } else {
+                std::fprintf(stderr, "strata serve: STRATA_ADAPT_EXCHANGE_DMA off: %s\n", derr.c_str());
+            }
+        }
+        std::vector<unsigned long long> adapt_dma_tab;   // the mirror table after the queued exchanges, uploaded after them
+        auto adapt_dma_wait = [&]() -> bool {
+            if (!adapt_dma_inflight) return true;
+            const Clock::time_point tw = Clock::now();
+            try {
+                adapt_dma_q->wait_and_throw();
+                gguf_src.exchange_dma_finished();
+                adapt_dma_inflight = false;
+                // the tables go up only now: an upload queued behind the exchanges (one copy engine) would wait for them
+                if (!adapt_dma_tab.empty()) {
+                    dpct::get_in_order_queue().memcpy(mirror_table_d, adapt_dma_tab.data(), adapt_dma_tab.size() * 8).wait_and_throw();
+                    adapt_dma_tab.clear();
+                    res_upload();
+                }
+            } catch (const std::exception& e) { std::fprintf(stderr, "SYCL mirror adaptive exchange failed: %s\n", e.what()); return false; }
+            g_adapt_wait_ms += std::chrono::duration<double, std::milli>(Clock::now() - tw).count();
+            return true;
+        };
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         auto adapt = [&](const std::vector<float>& usage_snap) -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
+            if (!adapt_dma_wait()) return false;  // (an earlier batch's copies: finished before this batch picks spares)
             if (remote_opt && !remote_opt->adapt(usage_snap, host_res, pending, o.adapt_swaps, *srcp)) return false;
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
@@ -8861,7 +8932,9 @@ int main(int argc, char **argv) try {
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                     if (r[e] < 0) { if (u[e] >= 2.0f && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e)) cand.emplace_back(u[e], e); }
-                    else vict.emplace_back(u[e], e);
+                    // the mirror-adaptive exchange leaves the prompt loan's slots alone: their refill after a prompt puts
+                    // back what they held, and their experts keep a mirror copy (STRATA_LEND_MIRROR) the exchange refuses
+                    else if (!(sycl_mirror_adapt() && lend_first >= 0 && r[e] >= lend_first)) vict.emplace_back(u[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;
                 std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { if (sycl_mirror_adapt() && a.first == b.first) return a.second < b.second; return a.first > b.first; });
@@ -8877,17 +8950,34 @@ int main(int argc, char **argv) try {
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
             if (sycl_mirror_adapt()) {
                 std::string error;
+                // STRATA_ADAPT_EXCHANGE_BATCH=1 (opt-in): the batch's exchanges are queued and the adapt stream is waited
+                // for once, instead of once per exchange (up to --adapt-swaps host<->GPU round trips in the decode loop)
+                static const bool batch_wait = [] { const char* v = std::getenv("STRATA_ADAPT_EXCHANGE_BATCH"); return v && v[0] == '1'; }();
+                const bool queued = batch_wait && !strata::kernels::b60_weights_packed();
+                const bool dma = adapt_async && adapt_dma_q != nullptr;
                 for (const Swap& s : swaps) {
                     const size_t in = (size_t)s.layer * g.n_expert + s.in;
                     const size_t out = (size_t)s.layer * g.n_expert + s.out;
                     const int32_t slot = host_res[out];
-                    if (host_res[in] >= 0 || slot < 0 || xcache.slot_of(s.layer, s.out) != slot ||
-                        !gguf_src.exchange_cached_expert(s.layer, s.in, s.out, xcache.device_slot(slot), adapt_stream, error)) {
+                    bool done = false;
+                    if (dma && host_res[in] < 0 && slot >= 0 && xcache.slot_of(s.layer, s.out) == slot) {
+                        done = gguf_src.exchange_cached_expert_dma(s.layer, s.in, s.out, xcache.device_slot(slot),
+                                                                   adapt_dma_q, error);
+                        if (!done && !error.empty()) { std::fprintf(stderr, "SYCL mirror adaptive exchange failed: %s\n", error.c_str()); return false; }
+                        if (done) adapt_dma_inflight = true;
+                    }
+                    if (!done && (host_res[in] >= 0 || slot < 0 || xcache.slot_of(s.layer, s.out) != slot ||
+                        !gguf_src.exchange_cached_expert(s.layer, s.in, s.out, xcache.device_slot(slot), adapt_stream, error, !queued))) {
                         std::fprintf(stderr, "SYCL mirror adaptive exchange failed: %s\n", error.c_str()); return false;
                     }
                     xcache.replace(s.layer, s.out, s.in);
                     host_res[out] = strata::core::kNotResident;
                     host_res[in] = slot;
+                }
+                g_adapt_swaps += (long long) swaps.size();
+                if (queued && !swaps.empty()) {
+                    try { adapt_stream->wait_and_throw(); }
+                    catch (const std::exception& e) { std::fprintf(stderr, "SYCL mirror adaptive exchange failed: %s\n", e.what()); return false; }
                 }
                 if (!swaps.empty()) {
                     std::vector<unsigned long long> tab(host_res.size(), 0ull);
@@ -8896,12 +8986,16 @@ int main(int argc, char **argv) try {
                         if (host_res[at] < 0) {
                             if (!gguf_src.pinned(l, e)) { std::fprintf(stderr, "SYCL mirror adaptive mirror complement missing\n"); return false; }
                             tab[at] = (unsigned long long)gguf_src.device_alias(l, e);
-                        } else if (gguf_src.pinned(l, e)) {
+                        } else if (gguf_src.pinned(l, e) && !(lend_first >= 0 && host_res[at] >= lend_first)) {
                             std::fprintf(stderr, "SYCL mirror adaptive mirror/cache overlap\n"); return false;
                         }
                     }
-                    dpct::get_in_order_queue().memcpy(mirror_table_d, tab.data(), tab.size() * 8).wait_and_throw();
-                    res_upload();
+                    if (adapt_dma_inflight) {   // STRATA_ADAPT_EXCHANGE_DMA: uploaded by adapt_dma_wait(), after the copies
+                        adapt_dma_tab = std::move(tab);
+                    } else {
+                        dpct::get_in_order_queue().memcpy(mirror_table_d, tab.data(), tab.size() * 8).wait_and_throw();
+                        res_upload();
+                    }
                 }
                 return true;
             }
@@ -11747,6 +11841,8 @@ int main(int argc, char **argv) try {
             const DecSnap ds0 = dec_snap();
             double dt_run = 0, dt_commit = 0, dt_draft = 0;
             int64_t dec_windows = 0, dec_T = 0;
+            const long long adapt_swaps0 = g_adapt_swaps;
+            const double adapt_ms0 = g_adapt_ms, adapt_wait0 = g_adapt_wait_ms;
             // STRATA_FOLLOW=<file> (test path, off by default): this request decodes the token ids in <file> (whitespace
             // separated, read and deleted at the request's start) instead of the argmax, through the real verify windows
             // with the MTP drafts; STRATA_FOLLOW_LOGPOS=<path> appends, for every valid window row, the teacher-forced
@@ -12804,7 +12900,13 @@ int main(int argc, char **argv) try {
                 bool adapt_ok = true;
                 if (!drive.d.usage.empty() && !ajob && pending.empty() && ((rounds + 1) % o.adapt_every) == 0) {
                     auto usnap = snapshot_usage();
-                    if (sycl_mirror_adapt()) adapt_ok = adapt(usnap);
+                    if (sycl_mirror_adapt()) {
+                        const Clock::time_point ta = Clock::now();
+                        adapt_async = true;   // STRATA_ADAPT_EXCHANGE_DMA: drained by adapt_dma_wait() after the draft
+                        adapt_ok = adapt(usnap);
+                        adapt_async = false;
+                        g_adapt_ms += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
+                    }
                     else adapt_thr = std::thread([&, u = std::move(usnap)] { adapt_ok = adapt(u); });
                 }
                 if (sycl_mirror_adapt() && !adapt_ok) { std::printf("ERR SYCL mirror adaptive exchange failed\n"); return 1; }
@@ -12920,6 +13022,7 @@ int main(int argc, char **argv) try {
                 const bool drafted = !draft_on || eos || produced_n >= max_new ||
                                      (use_df2 ? (defer_df2(a) || draft_df2(a)) : mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p));
                 draft_trace.finish();
+                if (!adapt_dma_wait()) { std::printf("ERR SYCL mirror adaptive exchange failed\n"); return 1; }
                 {
                     const Clock::time_point tw3 = Clock::now();
                     auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
@@ -12966,6 +13069,11 @@ int main(int argc, char **argv) try {
                              (d1.actq - ds0.actq) / w, (d1.jobs - ds0.jobs) / w, (d1.run - ds0.run) / w,
                              (d1.host - ds0.host) / w, dt_commit / w, dt_draft / w, (d1.misses - ds0.misses) / (w * L),
                              (d1.entries - ds0.entries) / (w * L), (d1.hits - ds0.hits) / (w * L), (d1.pcie - ds0.pcie) / (w * L));
+                if (sycl_mirror_adapt())
+                    std::fprintf(stderr, "strata decode timing: mirror-adaptive exchanges %.2f ms/window (in commit/emit), "
+                                         "%.2f swaps/window, %.2f ms/window waiting for the copy engine after the draft\n",
+                                 (g_adapt_ms - adapt_ms0) / w, (double) (g_adapt_swaps - adapt_swaps0) / w,
+                                 (g_adapt_wait_ms - adapt_wait0) / w);
                 for (int st = 0; st < n_stages; ++st) {   // every stage's GPU profile, not only the first card's
                     const std::string pr = stage_ver(st).profile_report();
                     if (pr.empty()) continue;
