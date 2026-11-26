@@ -1016,7 +1016,9 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
             std::fprintf(stderr, "strata verify: STRATA_MIRROR_STAGE ignored: the expert arena's size is unknown\n");
         }
     }
-    if (sycl_mirror_adapt()) {
+    // (a layer split's later stage that holds all of its experts in VRAM has nothing to exchange: no counts, and its
+    // all-resident graph has no device plan to count in)
+    if (sycl_mirror_adapt() && !all_resident_) {
         if (!device_plan_ || !env_on("STRATA_VERIFY_NO_HOST"))
             throw std::runtime_error("mirror adaptive expert usage requires NoHost device planning");
         expert_usage_counts_h_.assign((size_t)g.n_layers * (size_t)g.n_expert, 0);

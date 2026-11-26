@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <cstdio>
 #include <utility>
 #include <fcntl.h>
 #include <unistd.h>
@@ -313,6 +314,22 @@ bool GgufExpertSource::exchange_dma_reserve(int per_size, std::string& err) {
     for (int64_t l = 0; l < n_layers_; ++l) {
         const uint64_t b = spare_size(l);
         if (std::find(sizes.begin(), sizes.end(), b) == sizes.end()) sizes.push_back(b);
+    }
+    // the spares are pinned: check the free RAM first and keep 4 GiB of it for everything else, so that turning this on
+    // cannot push the host into swap or the OOM killer (the mirror itself was sized from the free RAM less 4 GiB)
+    uint64_t need = 0;
+    for (uint64_t b : sizes) need += b * (uint64_t) std::max<int64_t>(0, (int64_t) per_size - (int64_t) spare_[b].size());
+    uint64_t avail = 0;
+    if (FILE* f = std::fopen("/proc/meminfo", "r")) {
+        char key[64]; unsigned long long kb = 0;
+        while (std::fscanf(f, "%63s %llu kB", key, &kb) == 2)
+            if (std::strcmp(key, "MemAvailable:") == 0) { avail = (uint64_t) kb << 10; break; }
+        std::fclose(f);
+    }
+    if (need > 0 && (avail == 0 || avail < need + (4ull << 30))) {
+        err = "exchange DMA: the spare blobs need " + std::to_string(need >> 20) + " MiB of pinned RAM and only " +
+              std::to_string(avail >> 20) + " MiB is free (4096 MiB is kept for the rest); the exchanges stay as they are";
+        return false;
     }
     for (uint64_t b : sizes) {
         auto& pool = spare_[b];

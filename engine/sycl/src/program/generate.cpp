@@ -5562,7 +5562,10 @@ int main(int argc, char **argv) try {
     if (sycl_mirror_adapt()) {
         // The prompt loan (--prefill-borrow, the default) is allowed: the adaptive exchanges below never touch a slot the
         // prompt path borrows ([lend_first, slots)), so the loan's refill puts back the experts those slots held.
-        if (!o.serve || !o.stream_experts || srcp != &gguf_src || !stages.empty() ||
+        // A layer split is allowed when every later stage holds all of its experts in VRAM (checked once their caches are
+        // filled, below): the mirror and the exchanges then concern the first card only, and the later stages' layers
+        // never have a candidate.
+        if (!o.serve || !o.stream_experts || srcp != &gguf_src ||
             o.peer_device >= 0 || remote_caches ||
             o.vram_elastic || !mirror_table_d || unmirrored_misses ||
             o.adapt_every <= 0 || o.adapt_swaps <= 0 || o.adapt_swaps > 96 ||
@@ -5675,6 +5678,17 @@ int main(int argc, char **argv) try {
         if (later_misses > 0)
             std::fprintf(stderr, "strata generate: layer split: %lld experts of the later stages are not in VRAM (served by the host)\n",
                          (long long) later_misses);
+        // STRATA_SYCL_MIRROR_ADAPT on a layer split: only the first card has a mirror, so every later card must hold all of
+        // its layers' experts (an exchange there would have nowhere to put the expert it moves out)
+        if (sycl_mirror_adapt() && later_misses > 0) {
+            std::fprintf(stderr, "strata generate: REFUSED: the SYCL mirror adaptive cache on a layer split needs every later "
+                                 "card to hold all of its experts in VRAM; %lld do not fit there - move --layer-split so the last "
+                                 "card's layers fit, or unset STRATA_SYCL_MIRROR_ADAPT\n", (long long) later_misses);
+            refuse_exit(2);
+        }
+        if (sycl_mirror_adapt())
+            std::fprintf(stderr, "strata generate: layer split: the mirror adaptive cache exchanges the first card's experts only "
+                                 "(the later cards hold all of theirs)\n");
     }
 
     std::array<strata::core::RemoteExperts, 3> remote_experts;
